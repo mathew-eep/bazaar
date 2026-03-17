@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 
 from src.dataset import BazaarDataset
 from src.model import BazaarTFT
+from src.recency_aware import get_recency_weighted_sampler, RegimeShiftDetector
 
 
 QUANTILES = [0.1, 0.5, 0.9]
@@ -40,7 +41,7 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def build_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, list[DataLoader], BazaarDataset]:
+def build_dataloaders(args: argparse.Namespace, use_recency_bias: bool = True) -> tuple[DataLoader, list[DataLoader], BazaarDataset]:
     train_ds = BazaarDataset(
         db_path=args.db,
         split="train",
@@ -55,7 +56,17 @@ def build_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, list[DataLo
         augment_rare_mayor=True,
     )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    # Use recency-weighted sampler if enabled (biases toward recent data)
+    if use_recency_bias:
+        sampler = get_recency_weighted_sampler(
+            train_ds,
+            db_path=args.db,
+            decay_rate=0.95,
+            recent_months=12,
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=0)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
 
     n_windows = max(1, int(args.walk_forward_val_windows))
     if n_windows == 1:
@@ -193,7 +204,7 @@ def evaluate_walk_forward(
 
 def run_training(args: argparse.Namespace) -> None:
     device = get_device()
-    train_loader, val_loaders, train_ds = build_dataloaders(args)
+    train_loader, val_loaders, train_ds = build_dataloaders(args, use_recency_bias=args.recency_bias)
     model = build_model(train_ds, args, device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -204,6 +215,8 @@ def run_training(args: argparse.Namespace) -> None:
     best_path = ckpt_dir / "best.pt"
 
     best_val = float("inf")
+    regime_detector = RegimeShiftDetector(db_path=args.db, threshold_std=2.0)
+    regime_detector.compute_baseline()
 
     for epoch in range(args.epochs):
         train_loss = train_one_epoch(model, train_loader, opt, device, crossing_weight=args.crossing_weight)
@@ -229,11 +242,19 @@ def run_training(args: argparse.Namespace) -> None:
                 best_path,
             )
             print(f"  saved checkpoint: {best_path}")
+        
+        # Detect regime shifts periodically (every 5 epochs)
+        if (epoch + 1) % 5 == 0:
+            shift_info = regime_detector.detect_shift()
+            if shift_info["should_retrain"]:
+                print(f"  ⚠️  Regime shift detected! median_z={shift_info['median_z_score']:.2f}, "
+                      f"pct_shifted={shift_info['pct_items_shifted']:.1%}")
+                print(f"  💡 Consider retraining from best checkpoint with --recency-bias")
 
 
 def run_forward_smoke(args: argparse.Namespace) -> None:
     device = get_device()
-    train_loader, _, train_ds = build_dataloaders(args)
+    train_loader, _, train_ds = build_dataloaders(args, use_recency_bias=False)
     model = build_model(train_ds, args, device)
 
     batch = next(iter(train_loader))
@@ -276,6 +297,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
 
+    parser.add_argument(
+        "--recency-bias",
+        action="store_true",
+        default=True,
+        help="Use recency-weighted sampling to bias toward recent data (default: True).",
+    )
     parser.add_argument(
         "--forward-only",
         action="store_true",
