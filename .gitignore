@@ -12,6 +12,8 @@ __pycache__/
 dist/
 build/
 
+*.pt
+
 # Environment files
 .env
 .env.local
