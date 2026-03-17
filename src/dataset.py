@@ -33,6 +33,28 @@ from .features import (
 RARE_MAYORS = {"Derpy", "Jerry"}
 
 
+def _load_dependency_matrix(path: Path) -> np.ndarray:
+    # Detect Git LFS pointer files early and show a clear recovery hint.
+    try:
+        header = path.read_bytes()[:80]
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Missing dependency matrix at {path}") from exc
+
+    if header.startswith(b"version https://git-lfs.github.com/spec/v1"):
+        raise RuntimeError(
+            f"{path} is a Git LFS pointer, not real matrix data. "
+            "Run: git lfs install && git lfs pull"
+        )
+
+    try:
+        return np.load(path)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Failed to load dependency matrix at {path}. "
+            "If this repo uses Git LFS, run: git lfs install && git lfs pull"
+        ) from exc
+
+
 class BazaarDataset(Dataset):
     def __init__(
         self,
@@ -67,7 +89,7 @@ class BazaarDataset(Dataset):
 
         graph_dir = Path(graph_dir)
         self.item_index = json.loads((graph_dir / "item_index.json").read_text(encoding="utf-8"))
-        self.dependency_matrix = np.load(graph_dir / "dependency_matrix.npy")
+        self.dependency_matrix = _load_dependency_matrix(graph_dir / "dependency_matrix.npy")
 
         norm_stats_file = Path(norm_stats_path)
         if not norm_stats_file.exists():

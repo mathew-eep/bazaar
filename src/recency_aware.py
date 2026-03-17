@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import torch
@@ -100,19 +100,30 @@ class RegimeShiftDetector:
     def compute_baseline(self) -> dict:
         """Compute baseline price stats from all historical data."""
         conn = sqlite3.connect(self.db_path)
-        result = conn.execute("""
-            SELECT 
-                AVG(sell) as mean_price,
-                STDEV(sell) as std_price,
-                AVG(CAST(volume AS FLOAT)) as mean_volume
+        result = conn.execute(
+            """
+            SELECT sell, sell_volume
             FROM price_history
-        """).fetchone()
+            WHERE sell IS NOT NULL
+            """
+        ).fetchall()
         conn.close()
+
+        if not result:
+            self.baseline_stats = {
+                "mean_price": 0.0,
+                "std_price": 0.0,
+                "mean_volume": 0.0,
+            }
+            return self.baseline_stats
+
+        sells = np.asarray([float(r[0]) for r in result], dtype=np.float64)
+        volumes = np.asarray([float(r[1]) for r in result if r[1] is not None], dtype=np.float64)
         
         self.baseline_stats = {
-            "mean_price": result[0],
-            "std_price": result[1],
-            "mean_volume": result[2],
+            "mean_price": float(np.mean(sells)),
+            "std_price": float(np.std(sells)),
+            "mean_volume": float(np.mean(volumes)) if len(volumes) > 0 else 0.0,
         }
         return self.baseline_stats
     
@@ -127,24 +138,27 @@ class RegimeShiftDetector:
         conn = sqlite3.connect(self.db_path)
         
         # Get recent data stats (last N days)
-        recent_stats = conn.execute(f"""
-            SELECT 
-                item_tag,
-                AVG(sell) as recent_mean,
-                STDEV(sell) as recent_std,
-                COUNT(*) as count
+        recent_rows = conn.execute(
+            f"""
+            SELECT item_tag, sell
             FROM price_history
             WHERE timestamp > datetime('now', '-{self.window_days} days')
-            GROUP BY item_tag
-            HAVING count > 10
-        """).fetchall()
+              AND sell IS NOT NULL
+            """
+        ).fetchall()
         
         conn.close()
+
+        grouped_sells: dict[str, list[float]] = defaultdict(list)
+        for tag, sell in recent_rows:
+            grouped_sells[str(tag)].append(float(sell))
         
         shifts = {}
-        for tag, recent_mean, recent_std, count in recent_stats:
-            if recent_mean is None:
+        for tag, values in grouped_sells.items():
+            if len(values) <= 10:
                 continue
+
+            recent_mean = float(np.mean(values))
             
             # Z-score: how many stds away from baseline is recent mean?
             baseline_mean = self.baseline_stats["mean_price"]
