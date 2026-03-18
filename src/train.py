@@ -277,11 +277,29 @@ def run_training(args: argparse.Namespace) -> None:
     best_path = ckpt_dir / "best.pt"
 
     best_score = float("inf")
+    start_epoch = 0
+
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        state = torch.load(resume_path, map_location=device)
+        model_state = state.get("model_state", state)
+        model.load_state_dict(model_state)
+        if "optimizer_state" in state:
+            opt.load_state_dict(state["optimizer_state"])
+        start_epoch = int(state.get("epoch", -1)) + 1
+        if "score" in state:
+            best_score = float(state["score"])
+        elif "val_loss" in state:
+            best_score = float(state["val_loss"])
+        print(f"Resumed from {resume_path} at epoch {start_epoch}")
+
     regime_detector = RegimeShiftDetector(db_path=args.db, threshold_std=2.0)
     regime_detector.compute_baseline()
     epochs_without_improvement = 0
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(model, train_loader, opt, device, crossing_weight=args.crossing_weight)
         val_loss, val_parts = evaluate_walk_forward(model, val_loaders, device, crossing_weight=args.crossing_weight)
         val_worst = max(val_parts) if val_parts else val_loss
@@ -383,6 +401,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--resume", default=None, help="Path to checkpoint to resume/fine-tune from.")
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4)
 
