@@ -107,18 +107,24 @@ def build_val_loader(args: argparse.Namespace) -> tuple[DataLoader, BazaarDatase
 
 def build_model_from_dataset(ds: BazaarDataset, args: argparse.Namespace, device: torch.device) -> BazaarTFT:
     sample = ds[0]
-    model = BazaarTFT(
-        n_past_features=int(sample["past_obs"].shape[-1]),
-        n_future_features=int(sample["future_known"].shape[-1]),
-        n_static_features=int(sample["static"].shape[-1]),
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        lookback=args.lookback,
-        horizon=args.horizon,
-        n_quantiles=3,
-        dropout=args.dropout,
-    ).to(device)
-    return model
+        n_ensemble = getattr(args, "ensemble_size", 1)
+        models = []
+        for i in range(n_ensemble):
+            model = BazaarTFT(
+                n_past_features=int(sample["past_obs"].shape[-1]),
+                n_future_features=int(sample["future_known"].shape[-1]),
+                n_static_features=int(sample["static"].shape[-1]),
+                d_model=args.d_model,
+                n_heads=args.n_heads,
+                lookback=args.lookback,
+                horizon=args.horizon,
+                n_quantiles=3,
+                dropout=args.dropout,
+            ).to(device)
+            models.append(model)
+        if n_ensemble == 1:
+            return models[0]
+        return models
 
 
 def load_checkpoint_if_available(model: BazaarTFT, checkpoint: str | Path | None, device: torch.device) -> bool:
@@ -298,42 +304,60 @@ def item_level_metrics(pred: np.ndarray, target: np.ndarray, item_tags: np.ndarr
             continue
         p = pred[mask]
         t = target[mask]
-        cov10 = float((t <= p[..., 0]).mean())
-        cov50 = float((t <= p[..., 1]).mean())
-        cov90 = float((t <= p[..., 2]).mean())
-        mae50 = float(np.abs(t - p[..., 1]).mean())
-        rows.append(
-            {
-                "item_tag": str(tag),
-                "n_windows": int(mask.sum()),
-                "q10_coverage": cov10,
-                "q50_coverage": cov50,
-                "q90_coverage": cov90,
-                "q50_mae_norm": mae50,
-            }
-        )
-    return pd.DataFrame(rows).sort_values("q50_mae_norm", ascending=False)
+            if not args.skip_model_eval:
+                test_loader, test_ds = build_test_loader(args)
+                models = build_model_from_dataset(test_ds, args, device)
+                if isinstance(models, list):
+                    # Ensemble: average predictions
+                    preds = []
+                    for model in models:
+                        load_checkpoint_if_available(model, args.checkpoint, device)
+                        outputs = predict_test_set(model, test_loader, device, max_batches=args.max_batches)
+                        preds.append(outputs["pred"])
+                    pred_eval = np.mean(np.stack(preds, axis=0), axis=0)
+                    outputs = predict_test_set(models[0], test_loader, device, max_batches=args.max_batches)
+                else:
+                    model = models
+                    load_checkpoint_if_available(model, args.checkpoint, device)
+                    outputs = predict_test_set(model, test_loader, device, max_batches=args.max_batches)
+                    pred_eval = outputs["pred"]
 
+                quantiles = [0.1, 0.5, 0.9]
+                if args.calibrate_quantiles:
+                    val_loader, _ = build_val_loader(args)
+                    val_preds = []
+                    if isinstance(models, list):
+                        for model in models:
+                            val_outputs = predict_test_set(model, val_loader, device, max_batches=args.max_batches)
+                            val_preds.append(val_outputs["pred"])
+                        val_pred = np.mean(np.stack(val_preds, axis=0), axis=0)
+                        val_outputs = predict_test_set(models[0], val_loader, device, max_batches=args.max_batches)
+                    else:
+                        val_outputs = predict_test_set(model, val_loader, device, max_batches=args.max_batches)
+                        val_pred = val_outputs["pred"]
+                    offsets = fit_quantile_offsets(val_pred, val_outputs["target"], quantiles)
+                    pred_eval = apply_quantile_offsets(pred_eval, offsets)
+                    print("Post-hoc quantile calibration")
+                    print(f"  offsets={offsets.tolist()}")
 
-def build_anomaly_features(db_path: str | Path) -> pd.DataFrame:
-    import sqlite3
+                coverage_calibration(pred_eval, outputs["target"], quantiles)
+                simulated_pnl(
+                    pred_eval,
+                    outputs["target"],
+                    outputs["target_mean"],
+                    outputs["target_std"],
+                    outputs["current_sell_raw"],
+                    fee_rate=args.fee_rate,
+                    min_margin=args.min_margin,
+                )
 
-    con = sqlite3.connect(str(db_path))
-    try:
-        df = pd.read_sql_query(
-            """
-            SELECT item_tag, timestamp, sell, buy, sell_volume
-            FROM price_history
-            ORDER BY item_tag, timestamp
-            """,
-            con,
-        )
-    finally:
-        con.close()
-
-    if df.empty:
-        raise ValueError("price_history is empty; cannot fit anomaly detector")
-
+                item_metrics = item_level_metrics(pred_eval, outputs["target"], outputs["item_tag"])
+                out_path = Path(args.item_metrics_out)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                item_metrics.to_csv(out_path, index=False)
+                print("Item-level metrics")
+                print(f"  rows={len(item_metrics):,}")
+                print(f"  saved_to={out_path}")
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp", "sell", "buy", "sell_volume"]).copy()
 
@@ -398,7 +422,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--fee-rate", type=float, default=0.01)
     parser.add_argument("--min-margin", type=float, default=0.05)
-    parser.add_argument("--calibrate-quantiles", action="store_true")
+        parser.add_argument("--calibrate-quantiles", action="store_true", default=True)
+        parser.add_argument("--ensemble-size", type=int, default=1, help="Number of models in ensemble.")
     parser.add_argument("--item-metrics-out", default="data/item_metrics.csv")
 
     parser.add_argument("--contamination", type=float, default=0.02)

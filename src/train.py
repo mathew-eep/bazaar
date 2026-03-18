@@ -157,18 +157,24 @@ def build_model(train_ds: BazaarDataset, args: argparse.Namespace, device: torch
     n_future = int(sample["future_known"].shape[-1])
     n_static = int(sample["static"].shape[-1])
 
-    model = BazaarTFT(
-        n_past_features=n_past,
-        n_future_features=n_future,
-        n_static_features=n_static,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        lookback=args.lookback,
-        horizon=args.horizon,
-        n_quantiles=3,
-        dropout=args.dropout,
-    ).to(device)
-    return model
+    n_ensemble = getattr(args, "ensemble_size", 1)
+    models = []
+    for i in range(n_ensemble):
+        model = BazaarTFT(
+            n_past_features=n_past,
+            n_future_features=n_future,
+            n_static_features=n_static,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            lookback=args.lookback,
+            horizon=args.horizon,
+            n_quantiles=3,
+            dropout=args.dropout,
+        ).to(device)
+        models.append(model)
+    if n_ensemble == 1:
+        return models[0]
+    return models
 
 
 def maybe_autocast(device: torch.device):
@@ -251,7 +257,14 @@ def evaluate_walk_forward(
     device: torch.device,
     crossing_weight: float,
 ) -> tuple[float, list[float]]:
-    vals = [evaluate(model, ld, device, crossing_weight=crossing_weight) for ld in loaders]
+    n_mc = getattr(model, "mc_dropout", 5) if hasattr(model, "mc_dropout") else 5
+    vals = []
+    for ld in loaders:
+        mc_vals = []
+        for _ in range(n_mc):
+            model.train()  # Enable dropout for MC
+            mc_vals.append(evaluate(model, ld, device, crossing_weight=crossing_weight))
+        vals.append(np.mean(mc_vals))
     vals = [v for v in vals if np.isfinite(v)]
     if not vals:
         return float("inf"), []
@@ -407,6 +420,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--objective-mean-weight", type=float, default=0.7)
     parser.add_argument("--objective-worst-weight", type=float, default=0.3)
+    parser.add_argument("--ensemble-size", type=int, default=1, help="Number of models in ensemble.")
+    parser.add_argument("--mc-dropout", type=int, default=5, help="Monte Carlo dropout passes during evaluation.")
 
     parser.add_argument("--lr-plateau-patience", type=int, default=4)
     parser.add_argument("--lr-plateau-factor", type=float, default=0.5)

@@ -66,6 +66,8 @@ def _make_args(
         filter_min_windows=filter_min_windows,
         filter_max_q50_mae_norm=filter_max_q50_mae_norm,
         filter_coverage_eps=filter_coverage_eps,
+        ensemble_size=ensemble_size,
+        mc_dropout=mc_dropout,
     )
 
 
@@ -148,6 +150,8 @@ def main() -> None:
     filter_max_q50_mae_norm = st.sidebar.number_input("Filter max q50 MAE norm", min_value=0.0, value=0.5, step=0.05)
     filter_coverage_eps = st.sidebar.slider("Filter coverage epsilon", min_value=0.0, max_value=0.2, value=0.02, step=0.01)
 
+    ensemble_size = st.sidebar.number_input("Ensemble size", min_value=1, value=1, step=1)
+    mc_dropout = st.sidebar.number_input("MC dropout passes", min_value=1, value=5, step=1)
     args = _make_args(
         db=db,
         items=items,
@@ -167,6 +171,8 @@ def main() -> None:
         filter_min_windows=int(filter_min_windows),
         filter_max_q50_mae_norm=float(filter_max_q50_mae_norm),
         filter_coverage_eps=float(filter_coverage_eps),
+        ensemble_size=int(ensemble_size),
+        mc_dropout=int(mc_dropout),
     )
 
     col_a, col_b = st.columns(2)
