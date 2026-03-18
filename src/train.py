@@ -274,7 +274,8 @@ def evaluate_walk_forward(
 def run_training(args: argparse.Namespace) -> None:
     device = get_device()
     train_loader, val_loaders, train_ds = build_dataloaders(args, use_recency_bias=args.recency_bias)
-    model = build_model(train_ds, args, device)
+    models = build_model(train_ds, args, device)
+    model = models[0] if isinstance(models, list) else models
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
