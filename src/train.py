@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
@@ -13,6 +14,53 @@ from src.recency_aware import get_recency_weighted_sampler, RegimeShiftDetector
 
 
 QUANTILES = [0.1, 0.5, 0.9]
+
+
+def _load_allowed_items(args: argparse.Namespace) -> set[str] | None:
+    if not args.item_metrics_filter:
+        return None
+
+    metrics_path = Path(args.item_metrics_filter)
+    if not metrics_path.exists():
+        print(f"Item metrics filter file not found at {metrics_path}. Skipping item filter.")
+        return None
+
+    df = pd.read_csv(metrics_path)
+    required = {"item_tag", "n_windows", "q10_coverage", "q50_coverage", "q90_coverage", "q50_mae_norm"}
+    if not required.issubset(df.columns):
+        print(f"Item metrics file {metrics_path} missing required columns. Skipping item filter.")
+        return None
+
+    filtered = df.copy()
+    filtered = filtered[filtered["n_windows"] >= args.filter_min_windows]
+
+    if args.filter_max_q50_mae_norm is not None:
+        filtered = filtered[filtered["q50_mae_norm"] <= args.filter_max_q50_mae_norm]
+
+    eps = float(args.filter_coverage_eps)
+    filtered = filtered[
+        (filtered["q10_coverage"].between(eps, 1.0 - eps))
+        & (filtered["q50_coverage"].between(eps, 1.0 - eps))
+        & (filtered["q90_coverage"].between(eps, 1.0 - eps))
+    ]
+
+    allowed = set(filtered["item_tag"].astype(str).tolist())
+    print(
+        f"Item filter active: kept {len(allowed)} items from {len(df)} "
+        f"(min_windows={args.filter_min_windows}, max_mae={args.filter_max_q50_mae_norm}, coverage_eps={eps})"
+    )
+    return allowed
+
+
+def _apply_item_filter(ds: BazaarDataset, allowed_items: set[str] | None) -> None:
+    if not allowed_items:
+        return
+
+    before = len(ds.samples)
+    ds.item_tags = [tag for tag in ds.item_tags if tag in allowed_items]
+    ds.samples = [(tag, anchor) for (tag, anchor) in ds.samples if tag in allowed_items]
+    after = len(ds.samples)
+    print(f"Filtered dataset[{ds.split}] samples: {before} -> {after}")
 
 
 def pinball_loss(pred: torch.Tensor, target: torch.Tensor, quantiles: list[float] = QUANTILES) -> torch.Tensor:
@@ -42,6 +90,8 @@ def get_device() -> torch.device:
 
 
 def build_dataloaders(args: argparse.Namespace, use_recency_bias: bool = True) -> tuple[DataLoader, list[DataLoader], BazaarDataset]:
+    allowed_items = _load_allowed_items(args)
+
     train_ds = BazaarDataset(
         db_path=args.db,
         split="train",
@@ -55,6 +105,9 @@ def build_dataloaders(args: argparse.Namespace, use_recency_bias: bool = True) -
         auto_compute_norm_stats=True,
         augment_rare_mayor=True,
     )
+    _apply_item_filter(train_ds, allowed_items)
+    if len(train_ds) == 0:
+        raise RuntimeError("Training dataset is empty after item filtering. Relax filter thresholds.")
 
     # Use recency-weighted sampler if enabled (biases toward recent data)
     if use_recency_bias:
@@ -90,6 +143,9 @@ def build_dataloaders(args: argparse.Namespace, use_recency_bias: bool = True) -
             auto_compute_norm_stats=False,
             augment_rare_mayor=False,
         )
+        _apply_item_filter(val_ds, allowed_items)
+        if len(val_ds) == 0:
+            raise RuntimeError("Validation dataset is empty after item filtering. Relax filter thresholds.")
         val_loaders.append(DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0))
 
     return train_loader, val_loaders, train_ds
@@ -208,43 +264,74 @@ def run_training(args: argparse.Namespace) -> None:
     model = build_model(train_ds, args, device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt,
+        mode="min",
+        factor=args.lr_plateau_factor,
+        patience=args.lr_plateau_patience,
+        min_lr=args.lr_min,
+    )
 
     ckpt_dir = Path(args.checkpoints)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_path = ckpt_dir / "best.pt"
 
-    best_val = float("inf")
+    best_score = float("inf")
     regime_detector = RegimeShiftDetector(db_path=args.db, threshold_std=2.0)
     regime_detector.compute_baseline()
+    epochs_without_improvement = 0
 
     for epoch in range(args.epochs):
         train_loss = train_one_epoch(model, train_loader, opt, device, crossing_weight=args.crossing_weight)
         val_loss, val_parts = evaluate_walk_forward(model, val_loaders, device, crossing_weight=args.crossing_weight)
-        sched.step()
+        val_worst = max(val_parts) if val_parts else val_loss
+        score = args.objective_mean_weight * val_loss + args.objective_worst_weight * val_worst
+        sched.step(score)
+
+        current_lr = opt.param_groups[0]["lr"]
 
         if val_parts:
             parts = ",".join(f"{v:.5f}" for v in val_parts)
-            print(f"Epoch {epoch + 1:03d} | train={train_loss:.5f} | val_mean={val_loss:.5f} | val_windows=[{parts}]")
+            print(
+                f"Epoch {epoch + 1:03d} | train={train_loss:.5f} | val_mean={val_loss:.5f} "
+                f"| val_worst={val_worst:.5f} | score={score:.5f} | lr={current_lr:.2e} "
+                f"| val_windows=[{parts}]"
+            )
         else:
-            print(f"Epoch {epoch + 1:03d} | train={train_loss:.5f} | val_mean={val_loss:.5f}")
+            print(
+                f"Epoch {epoch + 1:03d} | train={train_loss:.5f} | val_mean={val_loss:.5f} "
+                f"| val_worst={val_worst:.5f} | score={score:.5f} | lr={current_lr:.2e}"
+            )
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if score < (best_score - args.early_stop_min_delta):
+            best_score = score
+            epochs_without_improvement = 0
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state": model.state_dict(),
                     "optimizer_state": opt.state_dict(),
-                    "val_loss": best_val,
+                    "val_loss": val_loss,
+                    "val_worst": val_worst,
+                    "score": best_score,
                     "args": vars(args),
                 },
                 best_path,
             )
             print(f"  saved checkpoint: {best_path}")
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= args.early_stop_patience:
+            print(
+                f"Early stopping at epoch {epoch + 1:03d}. "
+                f"No score improvement for {epochs_without_improvement} epochs. "
+                f"Best score={best_score:.5f}"
+            )
+            break
         
         # Detect regime shifts periodically (every 5 epochs)
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % args.regime_check_every == 0:
             shift_info = regime_detector.detect_shift()
             if shift_info["should_retrain"]:
                 print(f"  ⚠️  Regime shift detected! median_z={shift_info['median_z_score']:.2f}, "
@@ -296,6 +383,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--early-stop-patience", type=int, default=10)
+    parser.add_argument("--early-stop-min-delta", type=float, default=1e-4)
+
+    parser.add_argument("--objective-mean-weight", type=float, default=0.7)
+    parser.add_argument("--objective-worst-weight", type=float, default=0.3)
+
+    parser.add_argument("--lr-plateau-patience", type=int, default=4)
+    parser.add_argument("--lr-plateau-factor", type=float, default=0.5)
+    parser.add_argument("--lr-min", type=float, default=1e-6)
+
+    parser.add_argument("--item-metrics-filter", default=None)
+    parser.add_argument("--filter-min-windows", type=int, default=20)
+    parser.add_argument("--filter-max-q50-mae-norm", type=float, default=0.5)
+    parser.add_argument("--filter-coverage-eps", type=float, default=0.02)
+    parser.add_argument("--regime-check-every", type=int, default=5)
 
     parser.add_argument(
         "--recency-bias",

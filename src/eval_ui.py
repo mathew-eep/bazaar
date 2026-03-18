@@ -42,6 +42,10 @@ def _make_args(
     fee_rate: float,
     min_margin: float,
     max_batches: int | None,
+    item_metrics_filter: str | None,
+    filter_min_windows: int,
+    filter_max_q50_mae_norm: float,
+    filter_coverage_eps: float,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         db=db,
@@ -58,6 +62,10 @@ def _make_args(
         fee_rate=fee_rate,
         min_margin=min_margin,
         max_batches=max_batches,
+        item_metrics_filter=item_metrics_filter,
+        filter_min_windows=filter_min_windows,
+        filter_max_q50_mae_norm=filter_max_q50_mae_norm,
+        filter_coverage_eps=filter_coverage_eps,
     )
 
 
@@ -134,6 +142,12 @@ def main() -> None:
     calibrate_quantiles = st.sidebar.checkbox("Calibrate quantiles on val split", value=False)
     contamination = st.sidebar.slider("Isolation contamination", min_value=0.001, max_value=0.2, value=0.02, step=0.001)
 
+    enable_item_filter = st.sidebar.checkbox("Enable unstable-item filter", value=False)
+    item_metrics_filter = st.sidebar.text_input("Item metrics CSV", "data/item_metrics_ui.csv") if enable_item_filter else None
+    filter_min_windows = st.sidebar.number_input("Filter min windows", min_value=1, value=20)
+    filter_max_q50_mae_norm = st.sidebar.number_input("Filter max q50 MAE norm", min_value=0.0, value=0.5, step=0.05)
+    filter_coverage_eps = st.sidebar.slider("Filter coverage epsilon", min_value=0.0, max_value=0.2, value=0.02, step=0.01)
+
     args = _make_args(
         db=db,
         items=items,
@@ -149,6 +163,10 @@ def main() -> None:
         fee_rate=float(fee_rate),
         min_margin=float(min_margin),
         max_batches=max_batches,
+        item_metrics_filter=item_metrics_filter,
+        filter_min_windows=int(filter_min_windows),
+        filter_max_q50_mae_norm=float(filter_max_q50_mae_norm),
+        filter_coverage_eps=float(filter_coverage_eps),
     )
 
     col_a, col_b = st.columns(2)

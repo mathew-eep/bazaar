@@ -18,7 +18,55 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _load_allowed_items(args: argparse.Namespace) -> set[str] | None:
+    if not args.item_metrics_filter:
+        return None
+
+    metrics_path = Path(args.item_metrics_filter)
+    if not metrics_path.exists():
+        print(f"Item metrics filter file not found at {metrics_path}. Skipping item filter.")
+        return None
+
+    df = pd.read_csv(metrics_path)
+    required = {"item_tag", "n_windows", "q10_coverage", "q50_coverage", "q90_coverage", "q50_mae_norm"}
+    if not required.issubset(df.columns):
+        print(f"Item metrics file {metrics_path} missing required columns. Skipping item filter.")
+        return None
+
+    filtered = df.copy()
+    filtered = filtered[filtered["n_windows"] >= args.filter_min_windows]
+
+    if args.filter_max_q50_mae_norm is not None:
+        filtered = filtered[filtered["q50_mae_norm"] <= args.filter_max_q50_mae_norm]
+
+    eps = float(args.filter_coverage_eps)
+    filtered = filtered[
+        (filtered["q10_coverage"].between(eps, 1.0 - eps))
+        & (filtered["q50_coverage"].between(eps, 1.0 - eps))
+        & (filtered["q90_coverage"].between(eps, 1.0 - eps))
+    ]
+
+    allowed = set(filtered["item_tag"].astype(str).tolist())
+    print(
+        f"Item filter active: kept {len(allowed)} items from {len(df)} "
+        f"(min_windows={args.filter_min_windows}, max_mae={args.filter_max_q50_mae_norm}, coverage_eps={eps})"
+    )
+    return allowed
+
+
+def _apply_item_filter(ds: BazaarDataset, allowed_items: set[str] | None) -> None:
+    if not allowed_items:
+        return
+
+    before = len(ds.samples)
+    ds.item_tags = [tag for tag in ds.item_tags if tag in allowed_items]
+    ds.samples = [(tag, anchor) for (tag, anchor) in ds.samples if tag in allowed_items]
+    after = len(ds.samples)
+    print(f"Filtered dataset[{ds.split}] samples: {before} -> {after}")
+
+
 def build_test_loader(args: argparse.Namespace) -> tuple[DataLoader, BazaarDataset]:
+    allowed_items = _load_allowed_items(args)
     ds = BazaarDataset(
         db_path=args.db,
         split="test",
@@ -30,11 +78,15 @@ def build_test_loader(args: argparse.Namespace) -> tuple[DataLoader, BazaarDatas
         auto_compute_norm_stats=True,
         augment_rare_mayor=False,
     )
+    _apply_item_filter(ds, allowed_items)
+    if len(ds) == 0:
+        raise RuntimeError("Test dataset is empty after item filtering. Relax filter thresholds.")
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     return loader, ds
 
 
 def build_val_loader(args: argparse.Namespace) -> tuple[DataLoader, BazaarDataset]:
+    allowed_items = _load_allowed_items(args)
     ds = BazaarDataset(
         db_path=args.db,
         split="val",
@@ -46,6 +98,9 @@ def build_val_loader(args: argparse.Namespace) -> tuple[DataLoader, BazaarDatase
         auto_compute_norm_stats=True,
         augment_rare_mayor=False,
     )
+    _apply_item_filter(ds, allowed_items)
+    if len(ds) == 0:
+        raise RuntimeError("Validation dataset is empty after item filtering. Relax filter thresholds.")
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     return loader, ds
 
@@ -352,6 +407,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-model-eval", action="store_true")
     parser.add_argument("--skip-isolation", action="store_true")
     parser.add_argument("--max-batches", type=int, default=None)
+
+    parser.add_argument("--item-metrics-filter", default=None)
+    parser.add_argument("--filter-min-windows", type=int, default=20)
+    parser.add_argument("--filter-max-q50-mae-norm", type=float, default=0.5)
+    parser.add_argument("--filter-coverage-eps", type=float, default=0.02)
 
     return parser.parse_args()
 
